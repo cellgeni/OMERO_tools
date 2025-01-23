@@ -1,0 +1,5 @@
+conf_file_paths:
+    - path/to/conf1.yaml
+    - path/to/conf2.yaml
+omero_username: None
+omero_password: None
