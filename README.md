@@ -15,6 +15,8 @@ Both of the functions use the same input (csv file) and output (output folder pa
 **ann2Xenium_v2.py** - is basically the same as **ann2Xenium.py**, the only difference is how do you pass your OMERO credentials. in this version you will need to store your credentials in configuration file (so job can be runned non-interactively). Then make sure the configuration file is well protected (or delete you OMERO credentials from configuration file just after the job is done) 
 TODO: change the code the way that it can read environmental parameters from bash, in this case credentials will not be stored anywhere in the file
 
+**transfer_annotations_different_OMERO_servers.py** - transfer annotations for *same* images between 2 different OMERO servers. Before running it make sure you have access to both datasets in both OMERO servers. Details for both servers (host adresses and ports) should be hardcoded in the main function (*omero_id_1* corresponds to the server from which you copy annotations and *omero_id_2* - destination server). As input you have to provide csv file with 2 columns: *omero_id_1* and *omero_id_2* where you have to specify image IDs in each server. The code will ask your credentials for both servers at the beginning of the execution 
+
 ## Preparation
 
 Install conda environment using **environment.yml**. Make sure you have admin credentials for OMERO before running the script. Make a csv table file with information about OMERO ID of the sample, path to SpaceRanger output and rotational information. See **example.csv**
