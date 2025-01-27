@@ -43,30 +43,28 @@ def rgba_to_int(red, green, blue, alpha=255):
         rgba_int = rgba_int - 2**32
     return rgba_int
 
-def write_one_roi(omero_username, omero_password, omero_host, polygon, image_id):
+def write_one_roi(omero_username, omero_password, omero_host, polygon, image_id, omero_group_id, omero_user_id):
     
     #print(f"Connecting to {omero_srv} in port {omero_port}")
     #print(f"Using credentials: UserName={omero_username} Password={len(omero_password)*'*'}")
     with BlitzGateway(omero_username, omero_password, host=omero_host, secure = True) as connection:
         update_service = connection.getUpdateService()
         result = connection.connect()
-        #print(f"Connect: {result}")
-        _username = connection.getUser().getName()
-        _fullname = connection.getUser().getFullName()
-        #print(f"Connected as: UserName={_username} FullName={_fullname}")
-        group_id = -1
-        #group_id = 409
+        if omero_group_id != -1:
+            connection.SERVICE_OPTS.setOmeroGroup(omero_group_id)
+            connection.SERVICE_OPTS.setOmeroUser(omero_user_id)
+        else:
+            connection.SERVICE_OPTS.setOmeroGroup('-1')
         #print(f"SERVICE_OPTS.setOmeroGroup: {group_id}")
-        connection.SERVICE_OPTS.setOmeroGroup(group_id)
-
         #print(f"Get image: Id={image_id}")
         image = connection.getObject("Image", image_id)
         #print(f"IMAGE: Id={image.id} Name={image.name}")
         #print(f"GROUP: Id={image.details.group.id.val} Name={image.details.group.name.val}")
         roi = create_roi(image, [polygon])
-        #roi = create_roi(image, points)
-        #roi.textValue = rstring("test-Polygon")
-        update_service.saveObject(roi)
+        if omero_group_id != -1:
+            update_service.saveObject(roi, connection.SERVICE_OPTS)
+        else:
+            update_service.saveObject(roi)
 
 def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_port, omero_image_id):
     ROIs = []
@@ -112,14 +110,14 @@ def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_po
                         points.append([float(xy.split(",")[0]), float(xy.split(",")[1])])
 
                     #points = [(lambda xy : list(map(float,xy.split(","))))(xy) for xy in primary_shape.getPoints().val.split(" ")]
-                    ROIs.append({
-                    "name": name,
-                    "points": points,
-                    "stroke_color": stroke_color,
-                    "stroke_width": stroke_width,
-                    "fill_color": fill_color,
-                    "stroke_dash": stroke_dash,    
-                    })
+                ROIs.append({
+                "name": name,
+                "points": points,
+                "stroke_color": stroke_color,
+                "stroke_width": stroke_width,
+                "fill_color": fill_color,
+                "stroke_dash": stroke_dash,    
+                })
             except:
                 if primary_shape.__class__.__name__ == 'RectangleI':
                     points = get_corners_rectangle(primary_shape)
@@ -189,6 +187,14 @@ def main(csv_path):
     omero_host_2 = "wsi-omero-prod-02.internal.sanger.ac.uk" #"dtomero.sdsc.edu"
     omero_username_2, omero_password_2 = get_OMERO_credentials()
     
+    omero_2_group = -1
+    omero_2_user_id = None
+    #fill those values only if you have permission issues of running write_roi function
+    #omero_2_group = 409
+    #omero_2_user_id = 302
+    
+    
+    
     for i in range(table_input.shape[0]):
         
         omero_id_in = table_input['omero_id_1'][i]
@@ -197,7 +203,7 @@ def main(csv_path):
         print(str(i) + '/' + str(table_input.shape[0]))
         for roi in ROIs:
             pol = contstruct_polygon(roi)
-            write_one_roi(omero_username_2, omero_password_2, omero_host_2, pol, omero_id_out)
+            write_one_roi(omero_username_2, omero_password_2, omero_host_2, pol, omero_id_out, omero_2_group, omero_2_user_id)
    
 
 if __name__ == "__main__":
