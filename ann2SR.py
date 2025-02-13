@@ -23,6 +23,15 @@ import fire
 
 log = logging.getLogger(__name__)
 
+def get_ellipse_points(primary_shape, num_points = 1000):
+    center = [primary_shape.getX()._val, primary_shape.getY()._val]
+    radius_x = primary_shape.getRadiusX()._val; radius_y = primary_shape.getRadiusY()._val
+    t = np.linspace(0, 2 * np.pi, num_points, endpoint=False)  # endpoint=False to avoid repeating the first/last point
+    x = center[0] + radius_x * np.cos(t)
+    y = center[1] + radius_y * np.sin(t)
+    points = np.column_stack((x, y))
+    return points
+
 def get_OMERO_credentials():
     logging.basicConfig(format='%(asctime)s %(message)s')    
     log.setLevel(logging.DEBUG)
@@ -71,6 +80,12 @@ def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_im
             except:
                 if primary_shape.__class__.__name__ == 'RectangleI':
                     points = get_corners_rectangle(primary_shape)
+                    ROIs.append({
+                    "name": name,
+                    "points": points
+                    })
+                elif primary_shape.__class__.__name__ == 'EllipseI':
+                    points = get_ellipse_points(primary_shape)
                     ROIs.append({
                     "name": name,
                     "points": points
