@@ -40,6 +40,12 @@ def get_OMERO_credentials():
     omero_password = getpass("Password$")
     return omero_host, omero_username, omero_password
 
+def safe_float_convert(xy):
+    try:
+        return [float(x) for x in xy.split(",")]
+    except ValueError:
+        return None 
+
 def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_image_id, path_ann_csv):
     ROIs = []
     log.info(f"Connecting to OMERO at {omero_host}")
@@ -69,14 +75,18 @@ def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_im
             name = primary_shape.getTextValue().val
             #if ROI name is empty - renamed to "Non_labelled", makes sure first letter is capital, if additional csv provided - unified all different ROIs name into one
             name = rename_ROI(name, path_ann_csv)
-            #print(name)
-            #, separates x and y and  space separates points
+           
+            #, separates x and y and  space separates points in "safe" manner - do not use randomly occuring "" strings
             try:
-                points = [(lambda xy : list(map(float,xy.split(","))))(xy) for xy in primary_shape.getPoints().val.split(" ")]
+            
+            #points = [(lambda xy : list(map(float,xy.split(","))))(xy) for xy in primary_shape.getPoints().val.split(" ")]
+                points = [pt for pt in (safe_float_convert(xy) for xy in primary_shape.getPoints().val.split(" ")) if pt is not None]
+
                 ROIs.append({
                 "name": name,
                 "points": points
                 })
+                
             except:
                 if primary_shape.__class__.__name__ == 'RectangleI':
                     points = get_corners_rectangle(primary_shape)
@@ -91,7 +101,9 @@ def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_im
                     "points": points
                     })
                 else:
+                    log.info(f"Warning! Object '{name}' has unknown class: {primary_shape.__class__.__name__}")
                     pass
+             
             
             log.debug(f"Found ROI id={roi.id.val} name='{name}' type={primary_shape.__class__.__name__}")
 
@@ -213,7 +225,6 @@ def assign_barcode_rois(gROIs, df_in_tisssue, spaceranger_path):
     #log.info(f"Calling {len(df_in_tisssue)} Spots inside {len(ROIs)} ROIs.")
     for barcode,row in tqdm(df_in_tisssue.iterrows(), total=df_in_tisssue.shape[0]):
         spot_annotations = {}
-        
         spot = Point([row['pxl_col_in_fullres'],row['pxl_row_in_fullres']]).buffer(spot_radius)
         for roi_name,values in gROIs.items():
             coverage = 0.0
@@ -247,14 +258,17 @@ def get_dict_with_parents_child(gROIs):
                 if cname == pname: continue
                 for c in cpolygon:
                     # child test
-                    if c.within(p):
-                        #check if not in the list and add
-                        if cname not in hierarchy[pname]["children"]:
-                            hierarchy[pname]["children"].append(cname)
-                    # paternity test
-                    elif c.contains_properly(p):
-                        if cname not in hierarchy[pname]["parents"]:
-                            hierarchy[pname]["parents"].append(cname)
+                    try:
+                        if c.within(p):
+                            #check if not in the list and add
+                            if cname not in hierarchy[pname]["children"]:
+                                hierarchy[pname]["children"].append(cname)
+                        # paternity test
+                        elif c.contains_properly(p):
+                            if cname not in hierarchy[pname]["parents"]:
+                                hierarchy[pname]["parents"].append(cname)
+                    except:
+                        pass
 
     return hierarchy
 
@@ -288,8 +302,7 @@ def get_rois_non_zero(df_row):
     return list_of_rois
 
 def define_one_ROI_per_spot(df_rois, rois_dict, gROIs, spot_radius, df_in_tissue):
-    print(df_rois.shape)
-    print(df_in_tissue.shape)
+
     list_of_indeces = df_rois.index
     n = len(list_of_indeces)
     lst_Nones = [None for _ in range(n)]
@@ -413,7 +426,9 @@ def main(csv_path, out_folder, path_ann_csv = None, save_small_image = True, sav
         ROIs, image = collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_image_id, path_ann_csv)
         adata = read_SR_to_anndata(spaceranger_path)
         df_in_tissue = read_tissue_positions_SR(spaceranger_path)
-        
+        print('df_in_tissue')
+        print(np.max(df_in_tissue['pxl_row_in_fullres']))
+        print(np.max(df_in_tissue['pxl_col_in_fullres']))
         #rotate and flip polygons of ROIs
         New_polygons = rotate_flip_all_polygons(ROIs, image, rot_angle, flipX, flipY)
 
