@@ -22,6 +22,19 @@ import yaml
 
 log = logging.getLogger(__name__)
 
+def get_ellipse_points(primary_shape, num_points = 1000):
+    center = [primary_shape.getX()._val, primary_shape.getY()._val]
+    radius_x = primary_shape.getRadiusX()._val; radius_y = primary_shape.getRadiusY()._val
+    t = np.linspace(0, 2 * np.pi, num_points, endpoint=False)  # endpoint=False to avoid repeating the first/last point
+    x = center[0] + radius_x * np.cos(t)
+    y = center[1] + radius_y * np.sin(t)
+    points = np.column_stack((x, y))
+    return points
+
+def make_first_letter_upper(some_string):
+    if some_string[0].isupper() == False:
+        some_string = some_string[0].upper() + some_string[1:]
+    return some_string
 
 def get_OMERO_credentials():
     logging.basicConfig(format='%(asctime)s %(message)s')    
@@ -30,6 +43,19 @@ def get_OMERO_credentials():
     omero_username = input("Username$")
     omero_password = getpass("Password$")
     return omero_host, omero_username, omero_password
+
+def safe_float_convert(xy):
+    try:
+        return [float(x) for x in xy.split(",")]
+    except ValueError:
+        return None 
+
+def rename_ROI(old_name):
+    name = old_name
+    if name == '': name = 'Not_Labelled'
+    name = name.replace('/', '-')
+    name = make_first_letter_upper(name)
+    return str(name)
 
 def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_image_id):
     ROIs = []
@@ -55,18 +81,36 @@ def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_im
         result = roi_service.findByImage(image.id, None)
         #result has property roi - for one given image id
         for roi in result.rois:
-            try:
-                primary_shape = roi.getPrimaryShape()
-                name = primary_shape.getTextValue().val
-                #, separates x and y and  space separates points
-                points = [(lambda xy : list(map(float,xy.split(","))))(xy) for xy in primary_shape.getPoints().val.split(" ")]
+
+            primary_shape = roi.getPrimaryShape()
+            name = primary_shape.getTextValue().val
+            #if ROI name is empty - renamed to "Non_labelled", makes sure first letter is capital, if additional csv provided - unified all different ROIs name into one
+            name = rename_ROI(name)
+           
+            #, separates x and y and  space separates points in "safe" manner - do not use randomly occuring "" strings
+            if primary_shape.__class__.__name__ == 'PolygonI':
+                points = [pt for pt in (safe_float_convert(xy) for xy in primary_shape.getPoints().val.split(" ")) if pt is not None]
                 ROIs.append({
-                    "name": name,
-                    "points": points
+                "name": name,
+                "points": points
                 })
-                log.debug(f"Found ROI id={roi.id.val} name='{name}' type={primary_shape.__class__.__name__}")
-            except:
+            elif primary_shape.__class__.__name__ == 'RectangleI':
+                points = get_corners_rectangle(primary_shape)
+                ROIs.append({
+                "name": name,
+                "points": points
+                })
+            elif primary_shape.__class__.__name__ == 'EllipseI':
+                points = get_ellipse_points(primary_shape)
+                ROIs.append({
+                "name": name,
+                "points": points
+                })
+            else:
+                log.info(f"Warning! Object '{name}' has unknown class: {primary_shape.__class__.__name__}")
                 pass
+            log.debug(f"Found ROI id={roi.id.val} name='{name}' type={primary_shape.__class__.__name__}")
+
     log.info(f"Found {len(ROIs)} ROIs in total")
     return ROIs, image
 
