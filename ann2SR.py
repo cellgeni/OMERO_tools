@@ -330,8 +330,7 @@ def define_one_ROI_per_spot(df_rois, rois_dict, gROIs, spot_radius, df_in_tissue
                     polygon_list = gROIs[roi_name]
                     pos_spot_x = df_in_tissue['pxl_col_in_fullres'][i]; pos_spot_y = df_in_tissue['pxl_row_in_fullres'][i];
                     area_polygon = get_area_of_corresponding_polygon(polygon_list, pos_spot_x, pos_spot_y, spot_radius)
-                    print(roi_name)
-                    print(area_polygon)
+                    
                     if roi_name==list_of_rois[0]:
                         area_min = area_polygon
                         roi_name_max_level = roi_name
@@ -426,7 +425,6 @@ def main(csv_path, out_folder, path_ann_csv = None, save_small_image = True, sav
         ROIs, image = collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_image_id, path_ann_csv)
         adata = read_SR_to_anndata(spaceranger_path)
         df_in_tissue = read_tissue_positions_SR(spaceranger_path)
-        print('df_in_tissue')
         print(np.max(df_in_tissue['pxl_row_in_fullres']))
         print(np.max(df_in_tissue['pxl_col_in_fullres']))
         #rotate and flip polygons of ROIs
