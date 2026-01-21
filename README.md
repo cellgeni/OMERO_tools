@@ -17,6 +17,8 @@ TODO: change the code the way that it can read environmental parameters from bas
 
 **transfer_annotations_different_OMERO_servers.py** - transfer annotations for *same* images between 2 different OMERO servers. Before running it make sure you have access to both datasets in both OMERO servers. Details for both servers (host adresses and ports) should be hardcoded in the main function (*omero_id_1* corresponds to the server from which you copy annotations and *omero_id_2* - destination server). As input you have to provide csv file with 2 columns: *omero_id_1* and *omero_id_2* where you have to specify image IDs in each server. The code will ask your credentials for both servers at the beginning of the execution 
 
+**ann2Xenium_coord.py** - updated version of **ann2Xenium** code which also can pull coordinates for all annotations from OMERO image with its type. Can be used even for non-xenium experiments, actually for any image with annotations on it
+
 ## Preparation
 
 Install conda environment using **environment.yml**. Make sure you have admin credentials for OMERO before running the script. Make a csv table file with information about OMERO ID of the sample, path to SpaceRanger output and rotational information. See **example.csv**
