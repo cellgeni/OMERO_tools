@@ -4,7 +4,7 @@ import json
 import logging
 from getpass import getpass
 from numpy import random
-
+from datetime import datetime, timezone
 import omero
 import numpy as np
 import scanpy as sc
@@ -19,8 +19,184 @@ import matplotlib.pyplot as plt
 import squidpy as sq
 import fire
 import yaml
+import hashlib
+from datetime import datetime
 
 log = logging.getLogger(__name__)
+
+
+def _seed_from_time(known_time):
+    if isinstance(known_time, datetime):
+        s = known_time.isoformat()
+    else:
+        s = str(known_time)
+    h = hashlib.sha256(s.encode("utf-8")).digest()
+    return int.from_bytes(h[:4], "little", signed=False)
+
+def _parse_omero_points(points_obj):
+    """Parse OMERO points string -> (M,2) array of (x,y)."""
+    if points_obj is None:
+        return np.zeros((0,2), float)
+    # try common access patterns
+    try:
+        val = points_obj.getValue() if hasattr(points_obj, "getValue") else points_obj
+    except Exception:
+        val = points_obj
+    s = str(val).strip()
+    if not s:
+        return np.zeros((0,2), float)
+    toks = s.replace("\n"," ").replace("\t"," ").split()
+    pts = []
+    for tok in toks:
+        if "," in tok:
+            a,b = tok.split(",",1)
+        else:
+            parts = tok.split()
+            if len(parts)!=2:
+                continue
+            a,b = parts
+        try:
+            pts.append((float(a), float(b)))
+        except ValueError:
+            continue
+    return np.asarray(pts, dtype=float)
+
+def _densify_along_path(points_xy, n, closed=False):
+    """
+    Return n points sampled sequentially along the path defined by points_xy (x,y).
+    If closed=True, path is closed (last->first edge included).
+    Points returned in path order as (y,x).
+    """
+    if points_xy.shape[0] == 0 or n <= 0:
+        return np.zeros((0,2), float)
+    pts = points_xy.copy()
+    if closed:
+        # repeat first point at end for edge calculation
+        pts_ext = np.vstack([pts, pts[0:1]])
+    else:
+        pts_ext = pts
+    segs = pts_ext[1:] - pts_ext[:-1]   # (M-1, 2)
+    seg_len = np.hypot(segs[:,0], segs[:,1])
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total = cum[-1]
+    if total == 0:
+        # degenerate -> repeat single point
+        xy = np.tile(pts[0], (n,1))
+        return xy[:, ::-1]  # to (y,x)
+    # positions along path equally spaced from 0 .. total (excluded total if closed to avoid duplicate)
+    if closed:
+        dists = np.linspace(0, total, n, endpoint=False)
+    else:
+        dists = np.linspace(0, total, n, endpoint=True)
+    out_x = np.empty(n, dtype=float)
+    out_y = np.empty(n, dtype=float)
+    for i, d in enumerate(dists):
+        # find segment index
+        idx = np.searchsorted(cum, d, side='right') - 1
+        idx = min(max(idx, 0), len(seg_len)-1)
+        seg_d = d - cum[idx]
+        frac = seg_d / (seg_len[idx] + 1e-12)
+        sx, sy = pts_ext[idx]
+        ex, ey = pts_ext[idx+1]
+        xpt = sx + frac * (ex - sx)
+        ypt = sy + frac * (ey - sy)
+        out_x[i] = xpt
+        out_y[i] = ypt
+    return np.column_stack([out_y, out_x])  # (y,x)
+
+def roi_to_points(
+    roi_or_shapes,
+    known_time,
+    spots_per_shape=200,
+    total_spots=None,
+    clip_to_image_shape=None,
+    return_xy=False,
+):
+    """Return sequential (y,x) points per-shape suitable for constructing polygons/lines."""
+    # We keep deterministic seeding for any incidental randomness (not used here)
+    rng = np.random.default_rng(_seed_from_time(known_time))
+
+    # grab shapes
+    if hasattr(roi_or_shapes, "copyShapes"):
+        shapes = list(roi_or_shapes.copyShapes())
+    elif hasattr(roi_or_shapes, "iterateShapes"):
+        shapes = list(roi_or_shapes.iterateShapes())
+    else:
+        shapes = list(roi_or_shapes)
+
+    supported = [sh for sh in shapes if any(k in type(sh).__name__.lower() for k in ("rectangle","ellipse","polygon","polyline"))]
+    if not supported:
+        return np.zeros((0,2), float)
+
+    # allocate counts
+    if total_spots is not None:
+        base = total_spots // len(supported)
+        rem = total_spots % len(supported)
+        n_list = [base + (1 if i < rem else 0) for i in range(len(supported))]
+    else:
+        n_list = [int(spots_per_shape)] * len(supported)
+
+    out_chunks = []
+    for sh, n in zip(supported, n_list):
+        if n <= 0:
+            continue
+        nm = type(sh).__name__.lower()
+
+        # Rectangle -> build 4 corner vertices (x,y), then densify along closed perimeter
+        if "rectangle" in nm:
+            x = float(sh.getX().getValue()); y = float(sh.getY().getValue())
+            w = float(sh.getWidth().getValue()); h = float(sh.getHeight().getValue())
+            # vertices in clockwise order starting top-left
+            verts = np.array([
+                [x,     y    ],
+                [x + w, y    ],
+                [x + w, y + h],
+                [x,     y + h],
+            ], dtype=float)
+            pts = _densify_along_path(verts, n, closed=True)
+
+        # Ellipse -> parametric perimeter points in order
+        elif "ellipse" in nm:
+            cx = float(sh.getX().getValue()); cy = float(sh.getY().getValue())
+            rx = float(sh.getRadiusX().getValue()); ry = float(sh.getRadiusY().getValue())
+            thetas = np.linspace(0, 2*np.pi, n, endpoint=False)
+            xs = cx + rx * np.cos(thetas)
+            ys = cy + ry * np.sin(thetas)
+            pts = np.column_stack([ys, xs])
+
+        # Polygon -> parse vertices and densify along closed polygon
+        elif "polygon" in nm:
+            poly_xy = _parse_omero_points(getattr(sh, "getPoints", lambda: sh.getPoints())())
+            if poly_xy.shape[0] < 3:
+                continue
+            pts = _densify_along_path(poly_xy, n, closed=True)
+
+        # Polyline -> parse vertices and densify along open path
+        elif "polyline" in nm:
+            poly_xy = _parse_omero_points(getattr(sh, "getPoints", lambda: sh.getPoints())())
+            if poly_xy.shape[0] < 2:
+                continue
+            pts = _densify_along_path(poly_xy, n, closed=False)
+
+        else:
+            continue
+
+        out_chunks.append(pts)
+
+    if not out_chunks:
+        return np.zeros((0,2), float)
+
+    pts = np.vstack(out_chunks)
+
+    if clip_to_image_shape is not None:
+        H, W = clip_to_image_shape
+        pts[:,0] = np.clip(pts[:,0], 0, H-1)
+        pts[:,1] = np.clip(pts[:,1], 0, W-1)
+
+    if return_xy:
+        pts = pts[:, [1,0]]
+    pts[:, [0, 1]] = pts[:, [1, 0]]
+    return pts
 
 
 def ReadConfFile(FilePath):
@@ -71,18 +247,64 @@ def _rdouble_to_float(rdouble_obj):
 
 def _extract_shape_coordinates(shape):
     """
-    Extract coordinates and metadata from a single OMERO shape.
+    Extract coordinates and metadata from a single OMERO shape or an OMERO Roi container.
+
+    If 'shape' is a Roi container (RoiI), this will try to obtain the primary shape
+    (shape = roi.getPrimaryShape()) or the first child from roi.copyShapes() and parse that.
 
     Returns a dict with:
       - shape_id
       - shape_type   (raw OMERO class name)
-      - type         (one of: 'polygon', 'line', 'rectangle', 'circle')
+      - type         (one of: 'polygon', 'line', 'rectangle', 'circle' or None)
       - text         (label, if available)
       - coords       (geometry)
-        * polygon / line / curve: [[x1, y1], [x2, y2], ...]
-        * rectangle: {'x', 'y', 'width', 'height'}
-        * circle (ellipse): {'x', 'y', 'radius_x', 'radius_y'}
     """
+    # If a Roi container was accidentally passed in, try to get a concrete shape out of it
+    try:
+        st_name = shape.__class__.__name__.lower()
+    except Exception:
+        st_name = ""
+
+    if 'roii' in st_name:
+        # it's a Roi container — prefer its primary shape, otherwise the first child shape
+        try:
+            primary = None
+            if hasattr(shape, "getPrimaryShape"):
+                primary = shape.getPrimaryShape()
+            if primary is None and hasattr(shape, "copyShapes"):
+                shapes = shape.copyShapes()
+                # depending on the OMERO wrapper, copyShapes may return a list-like object or generator
+                if shapes:
+                    # shapes may be an OMERO wrapper object; try indexing first, else iterate
+                    try:
+                        primary = shapes[0]
+                    except Exception:
+                        # iterate to get first
+                        for s in shapes:
+                            primary = s
+                            break
+            if primary is not None:
+                # recurse on the concrete shape
+                return _extract_shape_coordinates(primary)
+            # If we couldn't find a child shape, return a minimal empty record
+            return {
+                'shape_id': None,
+                'shape_type': 'RoiI',
+                'type': None,
+                'text': None,
+                'coords': None,
+            }
+        except Exception:
+            log.exception("Failed to extract primary shape from RoiI")
+            return {
+                'shape_id': None,
+                'shape_type': 'RoiI',
+                'type': None,
+                'text': None,
+                'coords': None,
+            }
+
+    # From here on, 'shape' should be a concrete shape (PolygonI, RectangleI, EllipseI, etc.)
     shape_type = shape.__class__.__name__
     st_lower = shape_type.lower()
 
@@ -97,10 +319,12 @@ def _extract_shape_coordinates(shape):
     # Try to get text / label
     text_label = None
     try:
-        tv = shape.getTextValue()
-        if tv is not None:
-            text_label = tv.val
+        if hasattr(shape, "getTextValue"):
+            tv = shape.getTextValue()
+            if tv is not None:
+                text_label = tv.val
     except Exception:
+        # some shapes don't implement getTextValue
         pass
 
     coords = None
@@ -109,10 +333,17 @@ def _extract_shape_coordinates(shape):
     # Polygon / Polyline / curve-like (points field)
     if 'polygon' in st_lower or 'polyline' in st_lower:
         try:
-            pts_obj = shape.getPoints()
+            if hasattr(shape, "getPoints"):
+                pts_obj = shape.getPoints()
+            else:
+                pts_obj = None
             if pts_obj is not None:
-                pts_str = pts_obj.val.strip()
+                # pts_obj may be an OMERO wrapper where .val is the string of "x,y x,y ..."
+                pts_str = getattr(pts_obj, "val", None)
+                if pts_str is None and isinstance(pts_obj, (str, bytes)):
+                    pts_str = pts_obj
                 if pts_str:
+                    pts_str = pts_str.strip()
                     pts = [
                         list(map(float, xy.split(',')))
                         for xy in pts_str.split(' ')
@@ -138,7 +369,7 @@ def _extract_shape_coordinates(shape):
             geom_type = 'rectangle'
         except Exception:
             log.exception("Failed to parse Rectangle shape")
-
+    
     # Ellipse / Circle
     elif 'ellipse' in st_lower:
         try:
@@ -147,46 +378,48 @@ def _extract_shape_coordinates(shape):
             rx = _rdouble_to_float(shape.getRadiusX())
             ry = _rdouble_to_float(shape.getRadiusY())
             coords = {'x': x, 'y': y, 'radius_x': rx, 'radius_y': ry}
-            # Treat ellipse shapes as 'circle' type for downstream use
             geom_type = 'circle'
         except Exception:
             log.exception("Failed to parse Ellipse shape")
 
     # Line (straight line between 2 points)
     elif 'line' in st_lower:
-        # NOTE: PolylineI is handled above; this is simple LineI
         try:
+            # simple LineI uses getX1/getY1/getX2/getY2
             x1 = _rdouble_to_float(shape.getX1())
             y1 = _rdouble_to_float(shape.getY1())
             x2 = _rdouble_to_float(shape.getX2())
             y2 = _rdouble_to_float(shape.getY2())
-            # Represent line like polygon: list of [x, y] pairs
             coords = [[x1, y1], [x2, y2]]
             geom_type = 'line'
         except Exception:
             log.exception("Failed to parse Line shape")
 
-    # Fallback: if we have points, store them as polygon-like coords
+    # Fallback: if we have points via getPoints(), use them
     if coords is None and hasattr(shape, 'getPoints'):
         try:
-            if shape.getPoints() is not None:
-                pts_str = shape.getPoints().val.strip()
-                if pts_str:
-                    pts = [
-                        list(map(float, xy.split(',')))
-                        for xy in pts_str.split(' ')
-                        if xy
-                    ]
-                    coords = pts
-                    if geom_type is None:
-                        geom_type = 'polygon'
+            pts_obj = shape.getPoints()
+            pts_str = getattr(pts_obj, "val", None)
+            if pts_str is None and isinstance(pts_obj, (str, bytes)):
+                pts_str = pts_obj
+            if pts_str:
+                pts_str = pts_str.strip()
+                pts = [
+                    list(map(float, xy.split(',')))
+                    for xy in pts_str.split(' ')
+                    if xy
+                ]
+                coords = pts
+                if geom_type is None:
+                    geom_type = 'polygon'
         except Exception:
+            # silently ignore fallback errors
             pass
 
     return {
         'shape_id': shape_id,
         'shape_type': shape_type,
-        'type': geom_type,   # 'polygon', 'line', 'rectangle', 'circle'
+        'type': geom_type,   # 'polygon', 'line', 'rectangle', 'circle' or None
         'text': text_label,
         'coords': coords,
     }
@@ -267,13 +500,13 @@ def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_im
 
                 # ORIGINAL behaviour: parse polygon points from primary shape
                 try:
-                    pts_obj = primary_shape.getPoints()
-                    if pts_obj is not None:
-                        points = [
-                            (lambda xy: list(map(float, xy.split(","))))(xy)
-                            for xy in pts_obj.val.split(" ")
-                            if xy
-                        ]
+                    print(roi_name)
+                    #pts_obj = primary_shape.getPoints()
+                    known_time = datetime.now(timezone.utc).isoformat()
+                    points = roi_to_points(roi, known_time)
+                    print(points[:10])
+                    if points is not None:
+                        
                         ROIs.append({
                             "name": roi_name,
                             "points": points
@@ -447,10 +680,17 @@ def save_omero_annotations_to_json(
         json.dump(payload, f, ensure_ascii=False, indent=2)
     log.info(f"Saved OMERO ROI annotations JSON to: {out_path}")
 
+def get_OMERO_credentials():
+    logging.basicConfig(format='%(asctime)s %(message)s')    
+    log.setLevel(logging.DEBUG)
+    omero_host = "wsi-omero-prod-02.internal.sanger.ac.uk"
+    omero_username = input("Username$")
+    omero_password = getpass("Password$")
+    return omero_host, omero_username, omero_password
 
-def main(ConfFilePath, omero_username, omero_password, omero_host):
+def main(ConfFilePath):
     # here we assume one segmentation csv per one omero id!!
-    
+    omero_host, omero_username, omero_password = get_OMERO_credentials()
     (
         omero_image_id,
         column_name_x,
@@ -465,6 +705,20 @@ def main(ConfFilePath, omero_username, omero_password, omero_host):
         save_rois_positions,   # NEW flag
     ) = ReadConfFile(ConfFilePath)
 
+    (
+        omero_image_id,
+        column_name_x,
+        column_name_y,
+        segmentation_csv_path_list,
+        rot_angle,
+        flipX,
+        flipY,
+        pixelsize,
+        out_folder,
+        save_images,
+        save_rois_positions,   # NEW flag
+    ) = ReadConfFile(ConfFilePath)
+    
     # Collect polygons for cell assignment AND full geometry for all shapes
     ROIs, image, all_annotations = collect_ROIs_from_OMERO(
         omero_username,
