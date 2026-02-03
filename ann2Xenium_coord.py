@@ -500,11 +500,9 @@ def collect_ROIs_from_OMERO(omero_username, omero_password, omero_host, omero_im
 
                 # ORIGINAL behaviour: parse polygon points from primary shape
                 try:
-                    print(roi_name)
-                    #pts_obj = primary_shape.getPoints()
                     known_time = datetime.now(timezone.utc).isoformat()
                     points = roi_to_points(roi, known_time)
-                    print(points[:10])
+                    
                     if points is not None:
                         
                         ROIs.append({
