@@ -21,6 +21,9 @@ TODO: change the code the way that it can read environmental parameters from bas
 
 **ann2Xenium_coord.py** - updated version of **ann2Xenium** code which also can pull coordinates for all annotations from OMERO image with its type. Can be used even for non-xenium experiments, actually for any image with annotations on it
 
+**duplicate.py** -  Duplicate an OMERO entity (Project/Dataset/Image) across two projects. Images will carry annotations with them too. The code requires you to provide `--host` `--user` and `--password` for the server. There are 4 additional mandatory parameters `--type` (Project/Dataset/Image), `--id` ID of the entity _(multiple comma separated values can be passed)_, the group where you're copying from `--source-group` the group you're copying to `--target-group`. If you're only duplicating Images (`--type Image`) instead of Projects or Datasets, the duplicated images will end up inside `Orphaned Images` in the target group. 
+
+
 ## Preparation
 
 Install conda environment using **environment.yml**. Make sure you have admin credentials for OMERO before running the script. Make a csv table file with information about OMERO ID of the sample, path to SpaceRanger output and rotational information. See **example.csv**
