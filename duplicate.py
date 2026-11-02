@@ -53,6 +53,7 @@ import sys
 from omero.gateway import BlitzGateway
 from omero.cmd import Duplicate, Chgrp2, ERR
 from omero.callbacks import CmdCallbackI
+from omero.sys import ParametersI
 
 
 VALID_TYPES = ("Project", "Dataset", "Image")
@@ -147,19 +148,86 @@ def submit(conn, request, loops=500, poll_ms=1000):
     return rsp
 
 
-def find_new_id(duplicate_response, model_type):
-    """Extract the new object id of the given type from a DuplicateResponse.
+# HQL that returns (image id, fileset id) for every Image under the object.
+HQL_CONTAINER_IMAGES = {
+    "Project": (
+        "select distinct img.id, fs.id from Image img "
+        "left outer join img.fileset fs "
+        "join img.datasetLinks dil join dil.parent ds "
+        "join ds.projectLinks pdl join pdl.parent p "
+        "where p.id = :id"
+    ),
+    "Dataset": (
+        "select distinct img.id, fs.id from Image img "
+        "left outer join img.fileset fs "
+        "join img.datasetLinks dil join dil.parent ds "
+        "where ds.id = :id"
+    ),
+    "Image": (
+        "select img.id, fs.id from Image img "
+        "left outer join img.fileset fs "
+        "where img.id = :id"
+    ),
+}
+
+
+def _val(cell):
+    return None if cell is None else cell.getValue()
+
+
+def fileset_scan(conn, obj_type, obj_id):
+    """Find the Filesets of the Images under the object.
+
+    OMERO does not let a graph request (Duplicate, Chgrp2) split a Fileset.
+    If one Image of a multi-image Fileset is in the request, all Images of
+    that Fileset must be in the request.
+
+    Returns (fileset_ids, sibling_image_ids). sibling_image_ids are Images
+    that are in those Filesets but are NOT under the object.
+    """
+    qs = conn.getQueryService()
+    params = ParametersI()
+    params.addId(obj_id)
+    rows = qs.projection(HQL_CONTAINER_IMAGES[obj_type], params, conn.SERVICE_OPTS)
+    inside, fs_ids = set(), set()
+    for row in rows:
+        inside.add(_val(row[0]))
+        fs = _val(row[1])
+        if fs is not None:
+            fs_ids.add(fs)
+    if not fs_ids:
+        return [], []
+
+    params = ParametersI()
+    params.addIds(sorted(fs_ids))
+    rows = qs.projection(
+        "select img.id from Image img where img.fileset.id in (:ids)",
+        params, conn.SERVICE_OPTS)
+    all_imgs = {_val(r[0]) for r in rows}
+    return sorted(fs_ids), sorted(all_imgs - inside)
+
+
+def find_new_ids(duplicate_response, model_type):
+    """Return all new ids of the given type from a DuplicateResponse.
 
     The response maps fully-qualified model class names -> [new ids], e.g.
-    {"ome.model.containers.Project": [456]}.
+    {"ome.model.containers.Project": [456], "ome.model.fs.Fileset": [901]}.
     """
     for class_name, ids in duplicate_response.duplicates.items():
-        if class_name.split(".")[-1].lower() == model_type.lower() and ids:
-            return ids[0]
-    return None
+        if class_name.split(".")[-1].lower() == model_type.lower():
+            return list(ids)
+    return []
 
 
-def duplicate_across_groups(conn, obj_type, obj_id, source_group, target_group, move=False, loops=200, poll_ms=1000):
+def find_new_id(duplicate_response, model_type):
+    """Return the first new id of the given type, or None."""
+    ids = find_new_ids(duplicate_response, model_type)
+    return ids[0] if ids else None
+
+
+def duplicate_across_groups(conn, obj_type, obj_id, source_group, target_group,
+                            move=False, move_siblings=False, dry_run=False,
+                            loops=200, poll_ms=1000):
     conn.setGroupForSession(source_group)
     conn.SERVICE_OPTS.setOmeroGroup(source_group)
 
@@ -169,10 +237,40 @@ def duplicate_across_groups(conn, obj_type, obj_id, source_group, target_group, 
         raise RuntimeError(f"{obj_type} {obj_id} not found in group {source_group} (check id, type and permissions)")
     print(f"Found {obj_type}: '{obj.getName()}' (id={obj_id}) in group {source_group}")
 
+    # Add the Filesets to the request so that no Fileset is split.
+    fs_ids, sibling_imgs = fileset_scan(conn, obj_type, obj_id)
+    targets = {obj_type: [obj_id]}
+    if fs_ids:
+        targets["Fileset"] = fs_ids
+        print(f"Request includes {len(fs_ids)} Fileset(s): {fs_ids}")
+    if sibling_imgs:
+        print(f"WARNING: {len(sibling_imgs)} Image(s) share a Fileset with this {obj_type} "
+              f"but are not in it: {sibling_imgs}")
+
+    if dry_run:
+        print("DRY RUN: checking Duplicate and Chgrp2 without changes ...")
+        dup = Duplicate()
+        dup.targetObjects = targets
+        dup.dryRun = True
+        submit(conn, dup, loops, poll_ms)
+        print("  Duplicate check OK.")
+        chgrp = Chgrp2()
+        chgrp.targetObjects = targets
+        chgrp.groupId = target_group
+        chgrp.dryRun = True
+        submit(conn, chgrp, loops, poll_ms)
+        print("  Chgrp2 check OK.")
+        return None
+
     if move:
+        if sibling_imgs and not move_siblings:
+            raise RuntimeError(
+                f"Images {sibling_imgs} are outside this {obj_type} but share its Fileset(s). "
+                "A move also moves them out of their current containers. "
+                "Use --move-fileset-siblings to accept this.")
         print(f"*MOVING ORIGINAL* {obj_type} id={obj_id} -> group {target_group} ...")
         chgrp = Chgrp2()
-        chgrp.targetObjects = {obj_type: [obj_id]}
+        chgrp.targetObjects = targets
         chgrp.groupId = target_group
         submit(conn, chgrp, loops, poll_ms)
         print("Move complete.")
@@ -180,22 +278,32 @@ def duplicate_across_groups(conn, obj_type, obj_id, source_group, target_group, 
 
     print(f"Duplicating {obj_type} {obj_id} within group {source_group} (recursively) ...")
     dup = Duplicate()
-    dup.targetObjects = {obj_type: [obj_id]}
+    dup.targetObjects = targets
     dup_rsp = submit(conn, dup, loops, poll_ms)
 
     new_id = find_new_id(dup_rsp, obj_type)
     if new_id is None:
         raise RuntimeError(f"Duplicate succeeded but no new {obj_type} id was returned")
+    new_fs_ids = find_new_ids(dup_rsp, "Fileset")
     print("---")
     print(f"Created duplicate {obj_type} id={new_id} (still in group {source_group})")
+    if new_fs_ids:
+        print(f"Created duplicate Fileset(s): {new_fs_ids}")
     print("---")
+
+    chgrp_targets = {obj_type: [new_id]}
+    if new_fs_ids:
+        chgrp_targets["Fileset"] = new_fs_ids
     print(f"Moving duplicate {obj_type} {new_id} -> group {target_group} (recursively) ...")
     chgrp = Chgrp2()
-    chgrp.targetObjects = {obj_type: [new_id]}
+    chgrp.targetObjects = chgrp_targets
     chgrp.groupId = target_group
     submit(conn, chgrp, loops, poll_ms)
 
     print(f"Done. Duplicate {obj_type} id={new_id} now lives in group {target_group}; original untouched.")
+    if sibling_imgs:
+        print(f"NOTE: copies of sibling Images {sibling_imgs} are also in group {target_group}. "
+              "They can be outside the new container (orphaned). Check them.")
     return new_id
 
 
@@ -210,8 +318,10 @@ def parse_args(argv=None):
     p.add_argument("--source-group", required=True, metavar="GROUP", help="Group the object currently lives in (id or name)")
     p.add_argument("--target-group", required=True, metavar="GROUP", help="Group to copy (or move) the object into (id or name)")
     p.add_argument("--move", action="store_true", help="Move the original instead of duplicating (no copy left behind)")
+    p.add_argument("--move-fileset-siblings", action="store_true", help="With --move: also move Images outside the object that share its Fileset(s)")
+    p.add_argument("--dry-run", action="store_true", help="Check Duplicate and Chgrp2 on the server without making changes")
     p.add_argument("--stop-on-error", action="store_true", help="Abort immediately if any id fails (default: continue and report a summary)")
-    p.add_argument("--loops", type=int, default=200, help="Max poll iterations to wait per request (default 200)")
+    p.add_argument("--loops", type=int, default=1000, help="Max poll iterations to wait per request (default 200)")
     p.add_argument("--poll-ms", type=int, default=1000, help="Milliseconds between polls (default 1000)")
     return p.parse_args(argv)
 
@@ -258,6 +368,8 @@ def main(argv=None):
                     source_group=src_gid,
                     target_group=tgt_gid,
                     move=args.move,
+                    move_siblings=args.move_fileset_siblings,
+                    dry_run=args.dry_run,
                     loops=args.loops,
                     poll_ms=args.poll_ms,
                 )
